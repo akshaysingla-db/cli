@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -128,9 +129,16 @@ func formatDurationSecs(secs int64) string {
 }
 
 // listResponse is the JSON body returned by GET /api/2.0/lakebox/sandboxes.
+// `nextPageToken` is empty on the final page (or when the result fits in one).
 type listResponse struct {
-	Sandboxes []sandboxEntry `json:"sandboxes"`
+	Sandboxes     []sandboxEntry `json:"sandboxes"`
+	NextPageToken string         `json:"nextPageToken,omitempty"`
 }
+
+// listPageSize matches the manager-side default in `handlers::sandbox::list`.
+// Typical user fleets are well under this, so one round-trip covers them; the
+// pagination loop in `list` handles the rare larger fleet.
+const listPageSize = 100
 
 // apiError is the error body returned by the lakebox API.
 type apiError struct {
@@ -172,9 +180,34 @@ func (a *lakeboxAPI) create(ctx context.Context, name string) (*createResponse, 
 	return &result, nil
 }
 
-// list calls GET /api/2.0/lakebox/sandboxes.
+// list calls GET /api/2.0/lakebox/sandboxes, following pagination until the
+// server stops sending `next_page_token`. Returns the full set in one slice.
 func (a *lakeboxAPI) list(ctx context.Context) ([]sandboxEntry, error) {
-	resp, err := a.doRequest(ctx, "GET", lakeboxAPIPath, nil)
+	var all []sandboxEntry
+	pageToken := ""
+	for {
+		page, err := a.listPage(ctx, pageToken)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, page.Sandboxes...)
+		if page.NextPageToken == "" {
+			return all, nil
+		}
+		pageToken = page.NextPageToken
+	}
+}
+
+// listPage fetches a single page of sandboxes. An empty `pageToken` requests
+// the first page; the server enforces ordering across pages.
+func (a *lakeboxAPI) listPage(ctx context.Context, pageToken string) (*listResponse, error) {
+	q := url.Values{}
+	q.Set("page_size", strconv.Itoa(listPageSize))
+	if pageToken != "" {
+		q.Set("page_token", pageToken)
+	}
+
+	resp, err := a.doRequest(ctx, "GET", lakeboxAPIPath+"?"+q.Encode(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -188,7 +221,7 @@ func (a *lakeboxAPI) list(ctx context.Context) ([]sandboxEntry, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
-	return result.Sandboxes, nil
+	return &result, nil
 }
 
 // get calls GET /api/2.0/lakebox/sandboxes/{id}.
@@ -303,7 +336,18 @@ func (a *lakeboxAPI) doRequest(ctx context.Context, method, path string, body io
 			wsid = v
 		}
 	}
-	parsed.Path = strings.TrimRight(parsed.Path, "/") + path
+	// Callers may pass a leading query string (`...?page_token=...`) in `path`.
+	// Split it off so it lands in `RawQuery` rather than being URL-encoded into
+	// the path, and merge with the host's existing query (e.g. `?o=<wsid>`).
+	pathOnly, query, _ := strings.Cut(path, "?")
+	parsed.Path = strings.TrimRight(parsed.Path, "/") + pathOnly
+	if query != "" {
+		if parsed.RawQuery == "" {
+			parsed.RawQuery = query
+		} else {
+			parsed.RawQuery = parsed.RawQuery + "&" + query
+		}
+	}
 
 	req, err := http.NewRequestWithContext(ctx, method, parsed.String(), body)
 	if err != nil {
